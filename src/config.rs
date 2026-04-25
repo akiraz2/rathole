@@ -14,7 +14,7 @@ const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 40;
 
 /// Client
-const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
+const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 15;
 
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
@@ -104,6 +104,17 @@ pub struct ServerServiceConfig {
     pub bind_addr: String,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
+    /// Client-side forward address. When set, the server pushes this to clients
+    /// so they know where to forward traffic without needing their own config.
+    #[serde(default)]
+    pub local_addr: Option<String>,
+    /// Whether incoming visitor connections require approval before forwarding.
+    #[serde(default)]
+    pub require_approval: bool,
+    /// Agent that owns this service. When set, the service is only pushed
+    /// to the gateway channel of this agent.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 impl ServerServiceConfig {
@@ -204,6 +215,7 @@ pub struct ClientConfig {
     pub remote_addr: String,
     pub default_token: Option<MaskedString>,
     pub prefer_ipv6: Option<bool>,
+    #[serde(default)]
     pub services: HashMap<String, ClientServiceConfig>,
     #[serde(default)]
     pub transport: TransportConfig,
@@ -211,10 +223,22 @@ pub struct ClientConfig {
     pub heartbeat_timeout: u64,
     #[serde(default = "default_client_retry_interval")]
     pub retry_interval: u64,
+    /// Enable gateway mode. Client connects with no services and receives
+    /// all tunnel configs from the server. Defaults to true when services is empty.
+    #[serde(default)]
+    pub gateway: Option<bool>,
+    /// Agent identifier for per-agent gateway mode.
+    /// When set with gateway=true, connects as __gw_{agent_id}__ instead of __gateway__.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 fn default_heartbeat_interval() -> u64 {
     DEFAULT_HEARTBEAT_INTERVAL_SECS
+}
+
+fn default_approval_timeout() -> u64 {
+    60
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
@@ -222,6 +246,7 @@ fn default_heartbeat_interval() -> u64 {
 pub struct ServerConfig {
     pub bind_addr: String,
     pub default_token: Option<MaskedString>,
+    #[serde(default)]
     pub services: HashMap<String, ServerServiceConfig>,
     #[serde(default)]
     pub transport: TransportConfig,
@@ -229,11 +254,31 @@ pub struct ServerConfig {
     pub heartbeat_interval: u64,
 }
 
+/// Configuration for the runtime REST API.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ApiConfig {
+    /// Address to bind the API server (e.g. "127.0.0.1:9090")
+    pub bind_addr: String,
+    /// Optional bearer token for authentication
+    pub token: Option<MaskedString>,
+    /// Minimum allowed bind port for tunnels (inclusive)
+    pub port_range_min: Option<u16>,
+    /// Maximum allowed bind port for tunnels (inclusive)
+    pub port_range_max: Option<u16>,
+    /// URL to POST webhook notifications for pending connections
+    pub approval_webhook: Option<String>,
+    /// Timeout in seconds for approval (default 60)
+    #[serde(default = "default_approval_timeout")]
+    pub approval_timeout: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: Option<ServerConfig>,
     pub client: Option<ClientConfig>,
+    pub api: Option<ApiConfig>,
 }
 
 impl Config {
@@ -273,6 +318,16 @@ impl Config {
     }
 
     fn validate_client_config(client: &mut ClientConfig) -> Result<()> {
+        // Auto-enable gateway mode when no services are defined
+        if client.gateway.is_none() && client.services.is_empty() {
+            client.gateway = Some(true);
+        }
+
+        // Gateway mode requires default_token
+        if client.gateway == Some(true) && client.default_token.is_none() {
+            bail!("`default_token` is required in gateway mode (no services defined)");
+        }
+
         // Validate services
         for (name, s) in &mut client.services {
             s.name = name.clone();
