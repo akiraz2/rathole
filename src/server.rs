@@ -17,7 +17,7 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time;
@@ -632,21 +632,36 @@ async fn run_tcp_connection_pool<T: Transport>(
     let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
 
-    'pool: while let Some(mut visitor) = visitor_rx.recv().await {
+    'pool: while let Some(visitor) = visitor_rx.recv().await {
+        let mut visitor = Some(visitor);
         loop {
             if let Some(mut ch) = data_ch_rx.recv().await {
                 if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                    let v = visitor.take().unwrap();
                     tokio::spawn(async move {
-                        let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                        let (mut vr, mut vw) = io::split(v);
+                        let (mut cr, mut cw) = io::split(ch);
+                        tokio::select! {
+                            _ = io::copy(&mut vr, &mut cw) => {}
+                            _ = io::copy(&mut cr, &mut vw) => {}
+                        }
+                        let _ = AsyncWriteExt::shutdown(&mut cw).await;
+                        let _ = AsyncWriteExt::shutdown(&mut vw).await;
                     });
-                    break;
+                    break; // forwarded, continue accepting visitors
                 } else {
                     // Current data channel is broken. Request for a new one
                     if data_ch_req_tx.send(true).is_err() {
+                        if let Some(mut v) = visitor.take() {
+                            let _ = AsyncWriteExt::shutdown(&mut v).await;
+                        }
                         break 'pool;
                     }
                 }
             } else {
+                if let Some(mut v) = visitor.take() {
+                    let _ = AsyncWriteExt::shutdown(&mut v).await;
+                }
                 break 'pool;
             }
         }
